@@ -54,13 +54,18 @@ void DriveSessionManager::acceptReferencePoint(double latitude, double longitude
 }
 
 void DriveSessionManager::update(bool locationValid, double latitude, double longitude, double currentSpeedKmph,
-                                 uint32_t locationAgeMs, uint32_t nowMs)
+                                 uint32_t locationAgeMs, uint32_t nowMs, bool accumulateDistance)
 {
     if (isValidNumber(currentSpeedKmph)) {
         currentSpeedKmph_ = currentSpeedKmph;
-        if (currentSpeedKmph_ > maxSpeedKmph_) {
+        if (accumulateDistance && !paused_ && currentSpeedKmph_ > maxSpeedKmph_) {
             maxSpeedKmph_ = currentSpeedKmph_;
         }
+    }
+
+    if (!accumulateDistance) {
+        lastMovingUpdateMs_ = 0;
+        return;
     }
 
     const bool locationFresh = locationValid && locationAgeMs <= kMaxLocationAgeMs;
@@ -160,6 +165,15 @@ void DriveSessionManager::reset(uint32_t nowMs)
     movingSeconds_ = 0;
     acceptedPointCount_ = 0;
     rejectedPointCount_ = 0;
+}
+
+void DriveSessionManager::resetReferencePoint(double latitude, double longitude, uint32_t nowMs)
+{
+    referenceLat_ = latitude;
+    referenceLon_ = longitude;
+    referenceTimeMs_ = nowMs;
+    hasReference_ = true;
+    lastMovingUpdateMs_ = 0;
 }
 
 bool DriveSessionManager::paused() const

@@ -29,12 +29,20 @@ constexpr int32_t kBucketTiles = 64;
 constexpr size_t kBitmapBytes = 512;
 
 constexpr const char* kRoadbookDir = "/roadbook";
+constexpr const char* kJourneysDir = "/roadbook/journeys";
+constexpr const char* kDrivesDir = "/roadbook/drives";
+constexpr const char* kExplorerDir = "/roadbook/explorer";
+constexpr const char* kExplorerSessionsDir = "/roadbook/explorer/sessions";
+constexpr const char* kPhotosDir = "/roadbook/photos";
+constexpr const char* kSummariesDir = "/roadbook/summaries";
+constexpr const char* kLogsDir = "/roadbook/logs";
 constexpr const char* kTilesDir = "/roadbook/tiles";
 constexpr const char* kGridDir = "/roadbook/tiles/100";
 constexpr const char* kStatsPath = "/roadbook/stats_100.txt";
 constexpr const char* kStatsTempPath = "/roadbook/stats_100.txt.tmp";
-constexpr const char* kSelfTestPath = "/roadbook/.selftest";
+constexpr const char* kSelfTestTempPath = "/roadbook/.selftest.tmp";
 constexpr const char* kDiagnosticTestPath = "/roadbook/.sd_test.tmp";
+constexpr const char* kSelfTestPayload = "ROADBOOK_SD_TEST_V1";
 
 }  // namespace
 
@@ -134,18 +142,28 @@ bool StorageManager::mountAndInitialize(uint32_t& frequencyOut, bool logFailedAt
 
         cardSizeMB_ = SD.cardSize() / (1024ULL * 1024ULL);
 
-        if (ensureDirectories() && runSelfTest() && loadTotalTiles()) {
-            frequencyOut = frequency;
-            digitalWrite(kLoraNssPin, HIGH);
-            return true;
+        if (!ensureDirectories()) {
+            selfTestResult_ = SdSelfTestResult::DirectoryFailed;
+            SD.end();
+            deselectSpiSlaves();
+            if (logFailedAttempts) {
+                Serial.printf("SD frequency=%u mount=OK init=FAIL\n", frequency);
+            }
+            continue;
         }
 
-        SD.end();
-        deselectSpiSlaves();
-
-        if (logFailedAttempts) {
-            Serial.printf("SD frequency=%u mount=OK init=FAIL\n", frequency);
+        if (!runSelfTest() || !loadTotalTiles()) {
+            SD.end();
+            deselectSpiSlaves();
+            if (logFailedAttempts) {
+                Serial.printf("SD frequency=%u mount=OK init=FAIL\n", frequency);
+            }
+            continue;
         }
+
+        frequencyOut = frequency;
+        digitalWrite(kLoraNssPin, HIGH);
+        return true;
     }
 
     cardSizeMB_ = 0;
@@ -180,6 +198,7 @@ bool StorageManager::begin()
     cardSizeMB_ = 0;
     totalTiles_ = 0;
     lastRetryFrequencyHz_ = 0;
+    selfTestResult_ = SdSelfTestResult::NotRun;
 
     configureSpiSlavesInactive();
 
@@ -197,15 +216,20 @@ bool StorageManager::begin()
     Serial.printf("SD mount=%s\n", mounted ? "OK" : "FAIL");
 
     if (!mounted) {
+        if (selfTestResult_ == SdSelfTestResult::NotRun) {
+            selfTestResult_ = SdSelfTestResult::MountFailed;
+        }
         SD.end();
         deselectSpiSlaves();
+        Serial.printf("SD SELFTEST result=%s\n", selfTestResultText());
         return false;
     }
 
     Serial.println("SPI coexistence: SD mounted, LoRa inactive");
+    Serial.printf("SD SELFTEST result=%s\n", selfTestResultText());
     lastRetryFrequencyHz_ = frequencyHz;
-    ready_ = true;
-    return true;
+    ready_ = selfTestResult_ == SdSelfTestResult::Passed;
+    return ready_;
 }
 
 bool StorageManager::retry()
@@ -214,11 +238,15 @@ bool StorageManager::retry()
     cardSizeMB_ = 0;
     totalTiles_ = 0;
     lastRetryFrequencyHz_ = 0;
+    selfTestResult_ = SdSelfTestResult::NotRun;
 
     resetSpiBus();
 
     uint32_t frequencyHz = 0;
     if (!mountAndInitialize(frequencyHz, true)) {
+        if (selfTestResult_ == SdSelfTestResult::NotRun) {
+            selfTestResult_ = SdSelfTestResult::MountFailed;
+        }
         SD.end();
         deselectSpiSlaves();
         return false;
@@ -226,8 +254,8 @@ bool StorageManager::retry()
 
     digitalWrite(kLoraNssPin, HIGH);
     lastRetryFrequencyHz_ = frequencyHz;
-    ready_ = true;
-    return true;
+    ready_ = selfTestResult_ == SdSelfTestResult::Passed;
+    return ready_;
 }
 
 void StorageManager::printDiagnostics()
@@ -288,6 +316,8 @@ void StorageManager::printDiagnostics()
         Serial.println("delete test=FAIL");
     }
 
+    Serial.printf("selftest=%s\n", selfTestResultText());
+
     Serial.println("SD DIAG end");
 
     SD.end();
@@ -323,9 +353,39 @@ uint32_t StorageManager::lastRetryFrequencyHz() const
     return lastRetryFrequencyHz_;
 }
 
+bool StorageManager::flushPersistentState()
+{
+    if (!ready_) {
+        return true;
+    }
+
+    return saveTotalTiles();
+}
+
 bool StorageManager::ensureDirectories()
 {
     if (!SD.exists(kRoadbookDir) && !SD.mkdir(kRoadbookDir)) {
+        return false;
+    }
+    if (!SD.exists(kJourneysDir) && !SD.mkdir(kJourneysDir)) {
+        return false;
+    }
+    if (!SD.exists(kDrivesDir) && !SD.mkdir(kDrivesDir)) {
+        return false;
+    }
+    if (!SD.exists(kExplorerDir) && !SD.mkdir(kExplorerDir)) {
+        return false;
+    }
+    if (!SD.exists(kExplorerSessionsDir) && !SD.mkdir(kExplorerSessionsDir)) {
+        return false;
+    }
+    if (!SD.exists(kPhotosDir) && !SD.mkdir(kPhotosDir)) {
+        return false;
+    }
+    if (!SD.exists(kSummariesDir) && !SD.mkdir(kSummariesDir)) {
+        return false;
+    }
+    if (!SD.exists(kLogsDir) && !SD.mkdir(kLogsDir)) {
         return false;
     }
     if (!SD.exists(kTilesDir) && !SD.mkdir(kTilesDir)) {
@@ -339,31 +399,90 @@ bool StorageManager::ensureDirectories()
 
 bool StorageManager::runSelfTest()
 {
-    static constexpr const char kPayload[] = "roadbook";
+    selfTestResult_ = SdSelfTestResult::NotRun;
 
-    File writeFile = SD.open(kSelfTestPath, FILE_WRITE);
-    if (!writeFile) {
+    if (!SD.exists(kRoadbookDir) && !SD.mkdir(kRoadbookDir)) {
+        selfTestResult_ = SdSelfTestResult::DirectoryFailed;
         return false;
     }
-    if (writeFile.write(reinterpret_cast<const uint8_t*>(kPayload), sizeof(kPayload) - 1) != sizeof(kPayload) - 1) {
+
+    if (SD.exists(kSelfTestTempPath)) {
+        SD.remove(kSelfTestTempPath);
+    }
+
+    File writeFile = SD.open(kSelfTestTempPath, FILE_WRITE);
+    if (!writeFile) {
+        selfTestResult_ = SdSelfTestResult::WriteFailed;
+        return false;
+    }
+
+    const size_t payloadLength = std::strlen(kSelfTestPayload);
+    if (writeFile.write(reinterpret_cast<const uint8_t*>(kSelfTestPayload), payloadLength) != payloadLength) {
         writeFile.close();
-        SD.remove(kSelfTestPath);
+        SD.remove(kSelfTestTempPath);
+        selfTestResult_ = SdSelfTestResult::WriteFailed;
         return false;
     }
     writeFile.close();
 
-    File readFile = SD.open(kSelfTestPath, FILE_READ);
+    File readFile = SD.open(kSelfTestTempPath, FILE_READ);
     if (!readFile) {
-        SD.remove(kSelfTestPath);
+        SD.remove(kSelfTestTempPath);
+        selfTestResult_ = SdSelfTestResult::ReadFailed;
         return false;
     }
 
-    char buffer[16] = {};
-    const size_t bytesRead = readFile.read(reinterpret_cast<uint8_t*>(buffer), sizeof(kPayload) - 1);
+    char buffer[32] = {};
+    const size_t bytesRead = readFile.read(reinterpret_cast<uint8_t*>(buffer), payloadLength);
     readFile.close();
-    SD.remove(kSelfTestPath);
 
-    return bytesRead == (sizeof(kPayload) - 1) && std::strncmp(buffer, kPayload, sizeof(kPayload) - 1) == 0;
+    if (bytesRead != payloadLength) {
+        SD.remove(kSelfTestTempPath);
+        selfTestResult_ = SdSelfTestResult::ReadFailed;
+        return false;
+    }
+
+    if (std::strncmp(buffer, kSelfTestPayload, payloadLength) != 0) {
+        SD.remove(kSelfTestTempPath);
+        selfTestResult_ = SdSelfTestResult::VerifyFailed;
+        return false;
+    }
+
+    if (!SD.remove(kSelfTestTempPath)) {
+        selfTestResult_ = SdSelfTestResult::DeleteFailed;
+        return false;
+    }
+
+    selfTestResult_ = SdSelfTestResult::Passed;
+    return true;
+}
+
+SdSelfTestResult StorageManager::selfTestResult() const
+{
+    return selfTestResult_;
+}
+
+const char* StorageManager::selfTestResultText() const
+{
+    switch (selfTestResult_) {
+        case SdSelfTestResult::NotRun:
+            return "NOT_RUN";
+        case SdSelfTestResult::Passed:
+            return "PASSED";
+        case SdSelfTestResult::MountFailed:
+            return "MOUNT_FAILED";
+        case SdSelfTestResult::DirectoryFailed:
+            return "DIRECTORY_FAILED";
+        case SdSelfTestResult::WriteFailed:
+            return "WRITE_FAILED";
+        case SdSelfTestResult::ReadFailed:
+            return "READ_FAILED";
+        case SdSelfTestResult::VerifyFailed:
+            return "VERIFY_FAILED";
+        case SdSelfTestResult::DeleteFailed:
+            return "DELETE_FAILED";
+    }
+    return "NOT_RUN";
 }
 
 bool StorageManager::runDiagnosticFileTest(bool& writeOk, bool& readOk, bool& deleteOk)

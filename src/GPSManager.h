@@ -38,6 +38,10 @@ public:
     uint32_t locationAgeMs() const;
     bool speedValid() const;
 
+    bool hasAccurateFix() const;
+    bool hdopValid() const;
+    double hdop() const;
+
 private:
     struct Impl;
     Impl* _impl;

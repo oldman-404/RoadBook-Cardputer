@@ -7,11 +7,12 @@ public:
     void begin(uint32_t nowMs);
 
     void update(bool locationValid, double latitude, double longitude, double currentSpeedKmph, uint32_t locationAgeMs,
-                uint32_t nowMs);
+                uint32_t nowMs, bool accumulateDistance);
 
     void pause();
     void resume(uint32_t nowMs);
     void reset(uint32_t nowMs);
+    void resetReferencePoint(double latitude, double longitude, uint32_t nowMs);
 
     bool paused() const;
     bool started() const;

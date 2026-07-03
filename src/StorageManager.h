@@ -11,6 +11,17 @@ enum class TileMarkResult {
     NewlyVisited,
 };
 
+enum class SdSelfTestResult {
+    NotRun,
+    Passed,
+    MountFailed,
+    DirectoryFailed,
+    WriteFailed,
+    ReadFailed,
+    VerifyFailed,
+    DeleteFailed,
+};
+
 class StorageManager {
 public:
     bool begin();
@@ -22,6 +33,12 @@ public:
     uint32_t totalTiles() const;
     uint32_t lastRetryFrequencyHz() const;
 
+    SdSelfTestResult selfTestResult() const;
+    const char* selfTestResultText() const;
+    bool runSelfTest();
+
+    bool flushPersistentState();
+
     TileMarkResult markVisited(const GridTile& tile);
 
 private:
@@ -31,7 +48,6 @@ private:
     bool tryMount(uint32_t frequencyHz, uint8_t& cardTypeOut);
     bool mountAndInitialize(uint32_t& frequencyOut, bool logFailedAttempts = false);
     bool ensureDirectories();
-    bool runSelfTest();
     bool runDiagnosticFileTest(bool& writeOk, bool& readOk, bool& deleteOk);
     bool loadTotalTiles();
     bool saveTotalTiles();
@@ -47,4 +63,5 @@ private:
     uint64_t cardSizeMB_{0};
     uint32_t totalTiles_{0};
     uint32_t lastRetryFrequencyHz_{0};
+    SdSelfTestResult selfTestResult_{SdSelfTestResult::NotRun};
 };

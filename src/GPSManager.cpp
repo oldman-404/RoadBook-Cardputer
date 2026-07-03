@@ -2,6 +2,21 @@
 
 #include <MultipleSatellite.h>
 
+#include <cmath>
+
+namespace {
+
+constexpr uint32_t kMaxAccurateLocationAgeMs = 3000;
+constexpr uint32_t kMinAccurateSatellites = 4;
+constexpr double kMaxAccurateHdop = 3.0;
+
+bool isFiniteNumber(double value)
+{
+    return !std::isnan(value) && !std::isinf(value);
+}
+
+}  // namespace
+
 struct GPSManager::Impl {
     MultipleSatellite gps{Serial1, 115200, SERIAL_8N1, 15, 13};
     bool receivedData{false};
@@ -119,4 +134,46 @@ uint32_t GPSManager::locationAgeMs() const
 bool GPSManager::speedValid() const
 {
     return _impl->gps.speed.isValid();
+}
+
+bool GPSManager::hdopValid() const
+{
+    return _impl->gps.hdop.isValid();
+}
+
+double GPSManager::hdop() const
+{
+    if (!_impl->gps.hdop.isValid()) {
+        return 0.0;
+    }
+    return _impl->gps.hdop.hdop();
+}
+
+bool GPSManager::hasAccurateFix() const
+{
+    if (!_impl->gps.location.isValid()) {
+        return false;
+    }
+
+    const uint32_t ageMs = locationAgeMs();
+    if (ageMs > kMaxAccurateLocationAgeMs) {
+        return false;
+    }
+
+    if (satellites() < kMinAccurateSatellites) {
+        return false;
+    }
+
+    if (!_impl->gps.hdop.isValid()) {
+        return false;
+    }
+
+    const double hdopValue = _impl->gps.hdop.hdop();
+    if (!isFiniteNumber(hdopValue) || hdopValue > kMaxAccurateHdop) {
+        return false;
+    }
+
+    const double lat = latitude();
+    const double lon = longitude();
+    return isFiniteNumber(lat) && isFiniteNumber(lon);
 }
