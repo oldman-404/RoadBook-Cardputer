@@ -11,7 +11,19 @@ constexpr const char* kVersion = "0.0.1";
 constexpr uint32_t kSplashDurationMs = 1500;
 constexpr uint32_t kDashboardRefreshMs = 500;
 constexpr uint32_t kSerialDiagIntervalMs = 1000;
+constexpr uint32_t kNewTileDisplayMs = 1500;
 constexpr int kLineHeight = 12;
+
+M5Canvas& sharedCanvas()
+{
+    static M5Canvas canvas(&M5.Display);
+    static bool ready = false;
+    if (!ready) {
+        canvas.createSprite(M5.Display.width(), M5.Display.height());
+        ready = true;
+    }
+    return canvas;
+}
 
 void printKeyValue(uint8_t value)
 {
@@ -48,11 +60,32 @@ void printKeyValue(uint8_t value)
     }
 }
 
+const char* sessionResultLabel(SessionTileResult result)
+{
+    switch (result) {
+        case SessionTileResult::Added:
+            return "ADDED";
+        case SessionTileResult::AlreadyPresent:
+            return "VISITED";
+        case SessionTileResult::Full:
+            return "FULL";
+    }
+    return "VISITED";
+}
+
 }  // namespace
 
 void App::setup()
 {
     gps_.begin();
+    sessionTileCache_.clear();
+
+    if (storage_.begin()) {
+        Serial.printf("EXPLORER mode=SD persistentTotal=%u\n", storage_.totalTiles());
+    } else {
+        Serial.println("EXPLORER mode=RAM persistentTotal=unavailable");
+    }
+
     drawSplash();
     splashStartMs_ = millis();
     lastSerialDiagMs_ = splashStartMs_;
@@ -91,15 +124,27 @@ const char* App::gnssStatusLabel() const
     return "FIX";
 }
 
+const char* App::explorerStateLabel() const
+{
+    if (!gps_.hasFix() || !hasCurrentTile_) {
+        return "WAITING";
+    }
+    if (lastSessionResult_ == SessionTileResult::Full) {
+        return "CACHE FULL";
+    }
+    if (lastSessionResult_ == SessionTileResult::Added && (millis() - lastNewTileMs_) < kNewTileDisplayMs) {
+        return "NEW";
+    }
+    if (lastSessionResult_ == SessionTileResult::Added ||
+        lastSessionResult_ == SessionTileResult::AlreadyPresent) {
+        return "VISITED";
+    }
+    return "WAITING";
+}
+
 void App::drawGnssDashboard()
 {
-    static M5Canvas canvas(&M5.Display);
-    static bool canvasReady = false;
-
-    if (!canvasReady) {
-        canvas.createSprite(M5.Display.width(), M5.Display.height());
-        canvasReady = true;
-    }
+    M5Canvas& canvas = sharedCanvas();
 
     canvas.fillScreen(TFT_BLACK);
     canvas.setTextColor(TFT_WHITE);
@@ -163,6 +208,66 @@ void App::drawGnssDashboard()
     canvas.pushSprite(0, 0);
 }
 
+void App::drawExplorerDashboard()
+{
+    M5Canvas& canvas = sharedCanvas();
+
+    canvas.fillScreen(TFT_BLACK);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.setTextSize(1);
+
+    char line[48];
+    int y = 4;
+
+    canvas.drawString("RoadBook Explorer", 4, y);
+    y += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "GPS: %s", gps_.hasFix() ? "FIX" : "SEARCH");
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "MODE: %s", storage_.ready() ? "SD" : "RAM");
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    canvas.drawString("GRID: 100m", 4, y);
+    y += kLineHeight;
+
+    if (hasCurrentTile_ && gps_.hasFix()) {
+        std::snprintf(line, sizeof(line), "TILE X: %ld", static_cast<long>(currentTile_.x));
+    } else {
+        std::snprintf(line, sizeof(line), "TILE X: --");
+    }
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    if (hasCurrentTile_ && gps_.hasFix()) {
+        std::snprintf(line, sizeof(line), "TILE Y: %ld", static_cast<long>(currentTile_.y));
+    } else {
+        std::snprintf(line, sizeof(line), "TILE Y: --");
+    }
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "SESSION UNIQUE: %u", sessionTileCache_.count());
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    if (storage_.ready()) {
+        std::snprintf(line, sizeof(line), "TOTAL: %u", storage_.totalTiles());
+    } else {
+        std::snprintf(line, sizeof(line), "TOTAL: --");
+    }
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "STATE: %s", explorerStateLabel());
+    canvas.drawString(line, 4, y);
+
+    canvas.pushSprite(0, 0);
+}
+
 void App::printGnssDiagnostics()
 {
     const char* status = gnssStatusLabel();
@@ -177,12 +282,58 @@ void App::printGnssDiagnostics()
                   gps_.satellites());
 }
 
+void App::processExplorer()
+{
+    if (!gps_.hasFix()) {
+        return;
+    }
+
+    currentTile_ = grid_.calculateTile(gps_.latitude(), gps_.longitude());
+    hasCurrentTile_ = true;
+
+    if (hasLastProcessedTile_ && grid_.sameTile(currentTile_, lastProcessedTile_)) {
+        return;
+    }
+
+    lastProcessedTile_ = currentTile_;
+    hasLastProcessedTile_ = true;
+
+    lastSessionResult_ = sessionTileCache_.add(currentTile_.x, currentTile_.y);
+
+    if (lastSessionResult_ == SessionTileResult::Added) {
+        lastNewTileMs_ = millis();
+    }
+
+    Serial.printf("EXPLORER tile x=%ld y=%ld sessionResult=%s sessionUnique=%u\n", static_cast<long>(currentTile_.x),
+                  static_cast<long>(currentTile_.y), sessionResultLabel(lastSessionResult_),
+                  sessionTileCache_.count());
+
+    if (lastSessionResult_ == SessionTileResult::Full && !cacheFullLogged_) {
+        Serial.printf("EXPLORER cache full capacity=%u\n", sessionTileCache_.capacity());
+        cacheFullLogged_ = true;
+    }
+
+    if (storage_.ready()) {
+        storage_.markVisited(currentTile_);
+    }
+}
+
 void App::handleKeyboard()
 {
     M5Cardputer.update();
 
     if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) {
         return;
+    }
+
+    if (M5Cardputer.Keyboard.keysState().tab) {
+        if (state_ == AppState::GnssDashboard) {
+            state_ = AppState::ExplorerDashboard;
+            lastDashboardRefreshMs_ = 0;
+        } else if (state_ == AppState::ExplorerDashboard) {
+            state_ = AppState::GnssDashboard;
+            lastDashboardRefreshMs_ = 0;
+        }
     }
 
     for (const auto& keyPos : M5Cardputer.Keyboard.keyList()) {
@@ -196,6 +347,7 @@ void App::loop()
 
     handleKeyboard();
     gps_.update();
+    processExplorer();
 
     if (state_ == AppState::Splash && (now - splashStartMs_) >= kSplashDurationMs) {
         state_ = AppState::GnssDashboard;
@@ -203,9 +355,14 @@ void App::loop()
         drawGnssDashboard();
     }
 
-    if (state_ == AppState::GnssDashboard && (now - lastDashboardRefreshMs_) >= kDashboardRefreshMs) {
+    if ((state_ == AppState::GnssDashboard || state_ == AppState::ExplorerDashboard) &&
+        (now - lastDashboardRefreshMs_) >= kDashboardRefreshMs) {
         lastDashboardRefreshMs_ = now;
-        drawGnssDashboard();
+        if (state_ == AppState::GnssDashboard) {
+            drawGnssDashboard();
+        } else {
+            drawExplorerDashboard();
+        }
     }
 
     if ((now - lastSerialDiagMs_) >= kSerialDiagIntervalMs) {
