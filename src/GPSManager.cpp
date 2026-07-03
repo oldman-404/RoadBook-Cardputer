@@ -107,3 +107,16 @@ uint8_t GPSManager::second() const
 {
     return _impl->gps.time.second();
 }
+
+uint32_t GPSManager::locationAgeMs() const
+{
+    if (!_impl->gps.location.isValid()) {
+        return UINT32_MAX;
+    }
+    return _impl->gps.location.age();
+}
+
+bool GPSManager::speedValid() const
+{
+    return _impl->gps.speed.isValid();
+}

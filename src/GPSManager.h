@@ -35,6 +35,9 @@ public:
     uint8_t minute() const;
     uint8_t second() const;
 
+    uint32_t locationAgeMs() const;
+    bool speedValid() const;
+
 private:
     struct Impl;
     Impl* _impl;

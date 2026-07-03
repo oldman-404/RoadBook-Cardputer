@@ -11,7 +11,10 @@ constexpr const char* kVersion = "0.0.1";
 constexpr uint32_t kSplashDurationMs = 1500;
 constexpr uint32_t kDashboardRefreshMs = 500;
 constexpr uint32_t kSerialDiagIntervalMs = 1000;
+constexpr uint32_t kDriveSerialDiagIntervalMs = 5000;
+constexpr uint32_t kBatterySerialDiagIntervalMs = 30000;
 constexpr uint32_t kNewTileDisplayMs = 1500;
+constexpr uint32_t kDriveResetConfirmMs = 3000;
 constexpr int kLineHeight = 12;
 
 M5Canvas& sharedCanvas()
@@ -73,12 +76,22 @@ const char* sessionResultLabel(SessionTileResult result)
     return "VISITED";
 }
 
+void formatDuration(uint32_t totalSeconds, char* buffer, size_t bufferSize)
+{
+    const uint32_t hours = totalSeconds / 3600U;
+    const uint32_t minutes = (totalSeconds % 3600U) / 60U;
+    const uint32_t seconds = totalSeconds % 60U;
+    std::snprintf(buffer, bufferSize, "%u:%02u:%02u", hours, minutes, seconds);
+}
+
 }  // namespace
 
 void App::setup()
 {
     gps_.begin();
     sessionTileCache_.clear();
+    driveSession_.begin(millis());
+    batteryManager_.begin(millis());
 
     if (storage_.begin()) {
         Serial.printf("EXPLORER mode=SD persistentTotal=%u\n", storage_.totalTiles());
@@ -89,6 +102,8 @@ void App::setup()
     drawSplash();
     splashStartMs_ = millis();
     lastSerialDiagMs_ = splashStartMs_;
+    lastDriveSerialDiagMs_ = splashStartMs_;
+    lastBatterySerialDiagMs_ = splashStartMs_;
 }
 
 void App::drawSplash()
@@ -140,6 +155,20 @@ const char* App::explorerStateLabel() const
         return "VISITED";
     }
     return "WAITING";
+}
+
+const char* App::driveStatusLabel() const
+{
+    if (driveSession_.paused()) {
+        return "PAUSED";
+    }
+    if (!driveSession_.started()) {
+        return "WAITING";
+    }
+    if (gps_.hasFix() && gps_.speedValid() && gps_.speedKmph() >= 3.0) {
+        return "DRIVING";
+    }
+    return "STOPPED";
 }
 
 void App::drawGnssDashboard()
@@ -205,6 +234,7 @@ void App::drawGnssDashboard()
     }
     canvas.drawString(line, 4, y);
 
+    drawBatteryIndicator();
     canvas.pushSprite(0, 0);
 }
 
@@ -265,7 +295,128 @@ void App::drawExplorerDashboard()
     std::snprintf(line, sizeof(line), "STATE: %s", explorerStateLabel());
     canvas.drawString(line, 4, y);
 
+    drawBatteryIndicator();
     canvas.pushSprite(0, 0);
+}
+
+void App::drawDriveDashboard()
+{
+    M5Canvas& canvas = sharedCanvas();
+    const uint32_t now = millis();
+
+    canvas.fillScreen(TFT_BLACK);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setTextDatum(TL_DATUM);
+    canvas.setTextSize(1);
+
+    char line[48];
+    char timeBuffer[16];
+    int y = 4;
+
+    canvas.drawString("RoadBook Drive", 4, y);
+    y += kLineHeight;
+
+    if (driveResetPending_ && (now - driveResetRequestMs_) <= kDriveResetConfirmMs) {
+        canvas.drawString("Press X again to reset", 4, y);
+    } else {
+        std::snprintf(line, sizeof(line), "STATUS: %s", driveStatusLabel());
+        canvas.drawString(line, 4, y);
+    }
+    y += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "DIST: %.1f km", driveSession_.distanceKm());
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    formatDuration(driveSession_.elapsedSeconds(now), timeBuffer, sizeof(timeBuffer));
+    std::snprintf(line, sizeof(line), "TIME: %s", timeBuffer);
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    formatDuration(driveSession_.movingSeconds(), timeBuffer, sizeof(timeBuffer));
+    std::snprintf(line, sizeof(line), "MOVING: %s", timeBuffer);
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    if (gps_.speedValid()) {
+        std::snprintf(line, sizeof(line), "SPEED: %.1f km/h", driveSession_.currentSpeedKmph());
+    } else {
+        std::snprintf(line, sizeof(line), "SPEED: --");
+    }
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "AVG: %.1f km/h", driveSession_.averageMovingSpeedKmph());
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "MAX: %.1f km/h", driveSession_.maxSpeedKmph());
+    canvas.drawString(line, 4, y);
+    y += kLineHeight;
+
+    std::snprintf(line, sizeof(line), "POINTS: %u/%u", driveSession_.acceptedPointCount(),
+                  driveSession_.rejectedPointCount());
+    canvas.drawString(line, 4, y);
+
+    drawBatteryIndicator();
+    canvas.pushSprite(0, 0);
+}
+
+void App::drawBatteryIndicator()
+{
+    M5Canvas& canvas = sharedCanvas();
+
+    constexpr int kBodyWidth = 14;
+    constexpr int kBodyHeight = 8;
+    constexpr int kTerminalWidth = 2;
+    constexpr int kMarginRight = 4;
+    constexpr int kTop = 2;
+
+    char label[8];
+    if (batteryManager_.valid()) {
+        std::snprintf(label, sizeof(label), "%ld%%", static_cast<long>(batteryManager_.levelPercent()));
+    } else {
+        std::snprintf(label, sizeof(label), "--%%");
+    }
+
+    canvas.setTextSize(1);
+    canvas.setTextDatum(TR_DATUM);
+
+    const int textX = canvas.width() - kMarginRight;
+    const int textWidth = canvas.textWidth(label);
+    const int iconX = textX - textWidth - kTerminalWidth - kBodyWidth - 3;
+
+    uint32_t color = TFT_WHITE;
+    if (batteryManager_.valid()) {
+        const int32_t level = batteryManager_.levelPercent();
+        if (level <= 10) {
+            color = TFT_RED;
+        } else if (level <= 20) {
+            color = TFT_YELLOW;
+        }
+    }
+
+    canvas.drawRect(iconX, kTop, kBodyWidth, kBodyHeight, color);
+
+    const int terminalHeight = kBodyHeight / 2;
+    canvas.fillRect(iconX + kBodyWidth, kTop + (kBodyHeight - terminalHeight) / 2, kTerminalWidth, terminalHeight,
+                    color);
+
+    if (batteryManager_.valid()) {
+        const int innerWidth = kBodyWidth - 4;
+        const int innerHeight = kBodyHeight - 4;
+        const int fillWidth = (innerWidth * static_cast<int>(batteryManager_.levelPercent())) / 100;
+        if (fillWidth > 0) {
+            canvas.fillRect(iconX + 2, kTop + 2, fillWidth, innerHeight, color);
+        }
+    }
+
+    canvas.setTextColor(color);
+    canvas.drawString(label, textX, kTop + 1);
+    canvas.setTextColor(TFT_WHITE);
+    canvas.setTextDatum(TL_DATUM);
+
+    lastDisplayedBatteryPercent_ = batteryManager_.valid() ? batteryManager_.levelPercent() : -1;
 }
 
 void App::printGnssDiagnostics()
@@ -280,6 +431,31 @@ void App::printGnssDiagnostics()
 
     Serial.printf("GNSS chars=%u status=%s sat=%u lat=-- lon=--\n", gps_.charactersProcessed(), status,
                   gps_.satellites());
+}
+
+void App::printDriveDiagnostics()
+{
+    Serial.printf("DRIVE status=%s distance=%.1f moving=%u avg=%.1f max=%.1f points=%u rejected=%u\n",
+                  driveStatusLabel(), driveSession_.distanceKm(), driveSession_.movingSeconds(),
+                  driveSession_.averageMovingSpeedKmph(), driveSession_.maxSpeedKmph(),
+                  driveSession_.acceptedPointCount(), driveSession_.rejectedPointCount());
+}
+
+void App::printBatteryDiagnostics()
+{
+    if (batteryManager_.valid()) {
+        Serial.printf("BAT level=%ld voltage=%d valid=1\n", static_cast<long>(batteryManager_.levelPercent()),
+                      static_cast<int>(batteryManager_.voltageMillivolts()));
+        return;
+    }
+
+    Serial.println("BAT level=-- voltage=-- valid=0");
+}
+
+void App::updateDriveSession(uint32_t nowMs)
+{
+    driveSession_.update(gps_.hasFix(), gps_.latitude(), gps_.longitude(),
+                         gps_.speedValid() ? gps_.speedKmph() : 0.0, gps_.locationAgeMs(), nowMs);
 }
 
 void App::processExplorer()
@@ -331,8 +507,59 @@ void App::handleKeyboard()
             state_ = AppState::ExplorerDashboard;
             lastDashboardRefreshMs_ = 0;
         } else if (state_ == AppState::ExplorerDashboard) {
+            state_ = AppState::DriveDashboard;
+            lastDashboardRefreshMs_ = 0;
+        } else if (state_ == AppState::DriveDashboard) {
             state_ = AppState::GnssDashboard;
             lastDashboardRefreshMs_ = 0;
+        }
+    }
+
+    if (state_ == AppState::GnssDashboard || state_ == AppState::ExplorerDashboard ||
+        state_ == AppState::DriveDashboard) {
+        for (const auto& keyPos : M5Cardputer.Keyboard.keyList()) {
+            const uint8_t keyValue = M5Cardputer.Keyboard.getKey(keyPos);
+
+            if (keyValue == 'd' || keyValue == 'D') {
+                storage_.printDiagnostics();
+            }
+
+            if (keyValue == 's' || keyValue == 'S') {
+                const bool sdReady = storage_.retry();
+                if (sdReady) {
+                    Serial.printf("SD retry OK frequency=%u persistentTotal=%u\n",
+                                  storage_.lastRetryFrequencyHz(), storage_.totalTiles());
+                } else {
+                    Serial.println("SD retry FAIL");
+                }
+                lastDashboardRefreshMs_ = 0;
+            }
+        }
+    }
+
+    if (state_ == AppState::DriveDashboard) {
+        const uint32_t now = millis();
+
+        for (const auto& keyPos : M5Cardputer.Keyboard.keyList()) {
+            const uint8_t keyValue = M5Cardputer.Keyboard.getKey(keyPos);
+
+            if (keyValue == 'p' || keyValue == 'P') {
+                if (driveSession_.paused()) {
+                    driveSession_.resume(now);
+                } else {
+                    driveSession_.pause();
+                }
+            }
+
+            if (keyValue == 'x' || keyValue == 'X') {
+                if (driveResetPending_ && (now - driveResetRequestMs_) <= kDriveResetConfirmMs) {
+                    driveSession_.reset(now);
+                    driveResetPending_ = false;
+                } else {
+                    driveResetPending_ = true;
+                    driveResetRequestMs_ = now;
+                }
+            }
         }
     }
 
@@ -345,9 +572,23 @@ void App::loop()
 {
     const uint32_t now = millis();
 
+    if (driveResetPending_ && (now - driveResetRequestMs_) > kDriveResetConfirmMs) {
+        driveResetPending_ = false;
+    }
+
     handleKeyboard();
     gps_.update();
+    batteryManager_.update(now);
     processExplorer();
+    updateDriveSession(now);
+
+    if (state_ == AppState::GnssDashboard || state_ == AppState::ExplorerDashboard ||
+        state_ == AppState::DriveDashboard) {
+        const int32_t displayLevel = batteryManager_.valid() ? batteryManager_.levelPercent() : -1;
+        if (displayLevel != lastDisplayedBatteryPercent_) {
+            lastDashboardRefreshMs_ = 0;
+        }
+    }
 
     if (state_ == AppState::Splash && (now - splashStartMs_) >= kSplashDurationMs) {
         state_ = AppState::GnssDashboard;
@@ -355,18 +596,31 @@ void App::loop()
         drawGnssDashboard();
     }
 
-    if ((state_ == AppState::GnssDashboard || state_ == AppState::ExplorerDashboard) &&
+    if ((state_ == AppState::GnssDashboard || state_ == AppState::ExplorerDashboard ||
+         state_ == AppState::DriveDashboard) &&
         (now - lastDashboardRefreshMs_) >= kDashboardRefreshMs) {
         lastDashboardRefreshMs_ = now;
         if (state_ == AppState::GnssDashboard) {
             drawGnssDashboard();
-        } else {
+        } else if (state_ == AppState::ExplorerDashboard) {
             drawExplorerDashboard();
+        } else {
+            drawDriveDashboard();
         }
     }
 
     if ((now - lastSerialDiagMs_) >= kSerialDiagIntervalMs) {
         lastSerialDiagMs_ = now;
         printGnssDiagnostics();
+    }
+
+    if ((now - lastDriveSerialDiagMs_) >= kDriveSerialDiagIntervalMs) {
+        lastDriveSerialDiagMs_ = now;
+        printDriveDiagnostics();
+    }
+
+    if ((now - lastBatterySerialDiagMs_) >= kBatterySerialDiagIntervalMs) {
+        lastBatterySerialDiagMs_ = now;
+        printBatteryDiagnostics();
     }
 }
